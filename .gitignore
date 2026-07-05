@@ -1,0 +1,36 @@
+# Yocto build outputs / caches
+build/
+tmp/
+downloads/
+sstate-cache/
+cache/
+
+# Yocto image artifacts
+*.wic
+*.wic.gz
+*.ext4
+*.img
+*.bin
+*.elf
+*.iso
+*.hddimg
+*.tar
+*.tar.gz
+*.cpio
+*.cpio.gz
+*.manifest
+*.rootfs.*
+
+# Compiled files
+*.o
+*.a
+*.so
+
+# Python/cache
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
