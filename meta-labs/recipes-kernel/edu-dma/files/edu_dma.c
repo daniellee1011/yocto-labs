@@ -7,6 +7,9 @@
 #include <linux/dma-mapping.h>
 #include <linux/string.h>
 #include <linux/iopoll.h>
+#include <linux/completion.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
 
 #define EDU_VENDOR_ID       0x1234
 #define EDU_DEVICE_ID       0x11e8
@@ -29,13 +32,67 @@
 #define EDU_DMA_POLL_DELAY_US       1000
 #define EDU_DMA_TIMEOUT_US          1000000
 
+#define EDU_REG_IRQ_STATUS          0x24
+#define EDU_REG_IRQ_RAISE           0x60
+#define EDU_REG_IRQ_ACK             0x64
+
+#define EDU_IRQ_TEST                BIT(0)
+#define EDU_IRQ_TIMEOUT_MS          1000
+
 struct edu_device {
     struct pci_dev *pdev;
     void __iomem *bar0;
 
     void *dma_buffer;   // CPU virtual address; CPU accesses it
     dma_addr_t dma_handle;  // device/DMA address; hardware receives it
+
+    int irq;
+    u32 last_irq_status;
+    struct completion irq_done;
 };
+
+static irqreturn_t edu_irq_handler(int irq, void *data) {
+    struct edu_device *edu = data;
+    u32 status;
+
+    status = readl(edu->bar0 + EDU_REG_IRQ_STATUS);
+    if (!status)
+        return IRQ_NONE;
+
+    writel(status, edu->bar0 + EDU_REG_IRQ_ACK);
+
+    edu->last_irq_status = status;
+    complete(&edu->irq_done);
+
+    return IRQ_HANDLED;
+}
+
+static int edu_irq_self_test(struct edu_device *edu) {
+    unsigned long completed;
+
+    edu->last_irq_status = 0;
+    reinit_completion(&edu->irq_done);
+
+    writel(EDU_IRQ_TEST, edu->bar0 + EDU_REG_IRQ_RAISE);
+
+    completed = wait_for_completion_timeout(
+            &edu->irq_done, msecs_to_jiffies(EDU_IRQ_TIMEOUT_MS));
+    if (!completed) {
+        dev_err(&edu->pdev->dev, "IRQ self-test timed out\n");
+        return -ETIMEDOUT;
+    }
+
+    if (!(edu->last_irq_status & EDU_IRQ_TEST)) {
+        dev_err(&edu->pdev->dev,
+                "Unexpected IRQ status %#x\n", edu->last_irq_status);
+        return -EIO;
+    }
+
+    dev_info(&edu->pdev->dev, "IRQ self-test passed using %s\n",
+            pci_dev_msi_enabled(edu->pdev) ? "MSI" : "INTx");
+
+    return 0;
+}
 
 static int edu_wait_for_dma(struct edu_device *edu) {
     u32 command;
@@ -107,12 +164,15 @@ static int edu_probe(struct pci_dev *pdev,
     u32 test_value = 0x12345678;
     u32 liveness;
     int ret;
+    unsigned long irq_flags;
 
     edu = devm_kzalloc(&pdev->dev, sizeof(*edu), GFP_KERNEL);
     if (!edu)
         return -ENOMEM;
 
     edu->pdev = pdev;
+
+    init_completion(&edu->irq_done);
 
     ret = pci_enable_device_mem(pdev);
     if (ret) {
@@ -167,6 +227,29 @@ static int edu_probe(struct pci_dev *pdev,
     if (ret)
         goto err_free_dma;
 
+    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+    if (ret < 0) {
+        dev_err(&pdev->dev, "Failed to allocate IRQ vector\n");
+        goto err_free_dma;
+    }
+
+    edu->irq = pci_irq_vector(pdev, 0);
+    irq_flags = pci_dev_msi_enabled(pdev) ? 0 : IRQF_SHARED;
+
+    /* Clear any interrupt status left from an earlier driver instance. */
+    writel(~0U, edu->bar0 + EDU_REG_IRQ_ACK);
+
+    ret = request_irq(edu->irq, edu_irq_handler,
+            irq_flags, "edu_dma", edu);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to register IRQ handler\n");
+        goto err_free_vectors;
+    }
+
+    ret = edu_irq_self_test(edu);
+    if (ret)
+        goto err_free_irq;
+
     pci_set_drvdata(pdev, edu);
 
     dev_info(&pdev->dev, "BAR0 %pR\n", &pdev->resource[0]);
@@ -176,6 +259,13 @@ static int edu_probe(struct pci_dev *pdev,
     dev_info(&pdev->dev, "DMA bus address=%pad\n", &edu->dma_handle);
 
     return 0;
+
+err_free_irq:
+    writel(~0U, edu->bar0 + EDU_REG_IRQ_ACK);
+    free_irq(edu->irq, edu);
+
+err_free_vectors:
+    pci_free_irq_vectors(pdev);
 
 err_free_dma:
     pci_clear_master(pdev);
@@ -197,6 +287,10 @@ err_disable_device:
 
 static void edu_remove(struct pci_dev *pdev) {
     struct edu_device *edu = pci_get_drvdata(pdev);
+
+    writel(~0U, edu->bar0 + EDU_REG_IRQ_ACK);
+    free_irq(edu->irq, edu);
+    pci_free_irq_vectors(pdev);
 
     pci_clear_master(pdev);
 
