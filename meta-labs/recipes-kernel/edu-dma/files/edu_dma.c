@@ -39,6 +39,16 @@
 #define EDU_IRQ_TEST                BIT(0)
 #define EDU_IRQ_TIMEOUT_MS          1000
 
+static bool use_dma_irq = true;
+
+module_param(use_dma_irq, bool, 0444);
+MODULE_PARM_DESC(use_dma_irq,
+        "Use interrupts instead of polling for DMA completion");
+
+#define EDU_DMA_CMD_IRQ_ENABLE      BIT(2)
+#define EDU_IRQ_DMA                 BIT(8)
+#define EDU_DMA_TIMEOUT_MS          1000
+
 struct edu_device {
     struct pci_dev *pdev;
     void __iomem *bar0;
@@ -106,6 +116,46 @@ static int edu_wait_for_dma(struct edu_device *edu) {
     return ret;
 }
 
+static int edu_run_dma(struct edu_device *edu, u32 direction) {
+    unsigned long completed;
+    u32 status;
+
+    if (!use_dma_irq) {
+        dma_wmb();
+
+        writel(EDU_DMA_CMD_RUN | direction,
+                edu->bar0 + EDU_REG_DMA_CMD);
+
+        return edu_wait_for_dma(edu);
+    }
+
+    WRITE_ONCE(edu->last_irq_status, 0);
+    reinit_completion(&edu->irq_done);
+
+    writel(EDU_IRQ_DMA, edu->bar0 + EDU_REG_IRQ_ACK);
+
+    dma_wmb();
+
+    writel(EDU_DMA_CMD_RUN | EDU_DMA_CMD_IRQ_ENABLE | direction,
+            edu->bar0 + EDU_REG_DMA_CMD);
+
+    completed = wait_for_completion_timeout(
+            &edu->irq_done, msecs_to_jiffies(EDU_DMA_TIMEOUT_MS));
+    if (!completed) {
+        dev_err(&edu->pdev->dev, "DMA interrupt timed out\n");
+        return -ETIMEDOUT;
+    }
+
+    status = READ_ONCE(edu->last_irq_status);
+    if (!(status & EDU_IRQ_DMA)) {
+        dev_err(&edu->pdev->dev,
+                "Unexpected DMA IRQ status %#x\n", status);
+        return -EIO;
+    }
+
+    return 0;
+}
+
 static int edu_dma_self_test(struct edu_device *edu) {
     u8 *buffer = edu->dma_buffer;
     size_t index;
@@ -119,10 +169,7 @@ static int edu_dma_self_test(struct edu_device *edu) {
     writeq(EDU_DEVICE_BUFFER_OFFSET, edu->bar0 + EDU_REG_DMA_DST);
     writeq(EDU_DMA_TEST_SIZE, edu->bar0 + EDU_REG_DMA_COUNT);
 
-    dma_wmb();
-    writel(EDU_DMA_CMD_RUN, edu->bar0 + EDU_REG_DMA_CMD);
-
-    ret = edu_wait_for_dma(edu);
+    ret = edu_run_dma(edu, 0);
     if (ret)
         return ret;
 
@@ -133,11 +180,7 @@ static int edu_dma_self_test(struct edu_device *edu) {
     writeq((u64)edu->dma_handle, edu->bar0 + EDU_REG_DMA_DST);
     writeq(EDU_DMA_TEST_SIZE, edu->bar0 + EDU_REG_DMA_COUNT);
 
-    dma_wmb();
-    writel(EDU_DMA_CMD_RUN | EDU_DMA_CMD_FROM_DEVICE,
-            edu->bar0 + EDU_REG_DMA_CMD);
-
-    ret = edu_wait_for_dma(edu);
+    ret = edu_run_dma(edu, EDU_DMA_CMD_FROM_DEVICE);
     if (ret)
         return ret;
 
@@ -152,7 +195,8 @@ static int edu_dma_self_test(struct edu_device *edu) {
         }
     }
 
-    dev_info(&edu->pdev->dev, "DMA polling self-test passed\n");
+    dev_info(&edu->pdev->dev, "DMA %s self-test passed\n",
+            use_dma_irq ? "interrupt" : "polling");
 
     return 0;
 }
@@ -223,10 +267,6 @@ static int edu_probe(struct pci_dev *pdev,
 
     pci_set_master(pdev);
 
-    ret = edu_dma_self_test(edu);
-    if (ret)
-        goto err_free_dma;
-
     ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_LEGACY);
     if (ret < 0) {
         dev_err(&pdev->dev, "Failed to allocate IRQ vector\n");
@@ -250,6 +290,10 @@ static int edu_probe(struct pci_dev *pdev,
     if (ret)
         goto err_free_irq;
 
+    ret = edu_dma_self_test(edu);
+    if (ret)
+        goto err_stop_dma;
+
     pci_set_drvdata(pdev, edu);
 
     dev_info(&pdev->dev, "BAR0 %pR\n", &pdev->resource[0]);
@@ -259,6 +303,15 @@ static int edu_probe(struct pci_dev *pdev,
     dev_info(&pdev->dev, "DMA bus address=%pad\n", &edu->dma_handle);
 
     return 0;
+
+err_stop_dma:
+    pci_clear_master(pdev);
+
+    writel(~0U, edu->bar0 + EDU_REG_IRQ_ACK);
+    free_irq(edu->irq, edu);
+    pci_free_irq_vectors(pdev);
+
+    goto err_free_dma_buffer;
 
 err_free_irq:
     writel(~0U, edu->bar0 + EDU_REG_IRQ_ACK);
@@ -270,6 +323,7 @@ err_free_vectors:
 err_free_dma:
     pci_clear_master(pdev);
 
+err_free_dma_buffer:
     dma_free_coherent(&pdev->dev, EDU_DMA_BUFFER_SIZE,
             edu->dma_buffer, edu->dma_handle);
 
@@ -288,11 +342,11 @@ err_disable_device:
 static void edu_remove(struct pci_dev *pdev) {
     struct edu_device *edu = pci_get_drvdata(pdev);
 
+    pci_clear_master(pdev);
+
     writel(~0U, edu->bar0 + EDU_REG_IRQ_ACK);
     free_irq(edu->irq, edu);
     pci_free_irq_vectors(pdev);
-
-    pci_clear_master(pdev);
 
     dma_free_coherent(&pdev->dev,
             EDU_DMA_BUFFER_SIZE, edu->dma_buffer, edu->dma_handle);
