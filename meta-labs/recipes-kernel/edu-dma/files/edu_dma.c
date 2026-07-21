@@ -49,6 +49,13 @@ MODULE_PARM_DESC(use_dma_irq,
 #define EDU_IRQ_DMA                 BIT(8)
 #define EDU_DMA_TIMEOUT_MS          1000
 
+struct edu_device;
+
+struct edu_dma_ops {
+    const char *name;
+    int (*run)(struct edu_device *edu, u32 direction);
+};
+
 struct edu_device {
     struct pci_dev *pdev;
     void __iomem *bar0;
@@ -59,6 +66,8 @@ struct edu_device {
     int irq;
     u32 last_irq_status;
     struct completion irq_done;
+
+    const struct edu_dma_ops *dma_ops;
 };
 
 static irqreturn_t edu_irq_handler(int irq, void *data) {
@@ -116,18 +125,22 @@ static int edu_wait_for_dma(struct edu_device *edu) {
     return ret;
 }
 
-static int edu_run_dma(struct edu_device *edu, u32 direction) {
+static int edu_run_dma_polling(struct edu_device *edu, u32 direction) {
+    dma_wmb();
+
+    writel(EDU_DMA_CMD_RUN | direction, edu->bar0 + EDU_REG_DMA_CMD);
+
+    return edu_wait_for_dma(edu);
+}
+
+static const struct edu_dma_ops edu_dma_polling_ops = {
+    .name = "polling",
+    .run = edu_run_dma_polling,
+};
+
+static int edu_run_dma_interrupt(struct edu_device *edu, u32 direction) {
     unsigned long completed;
     u32 status;
-
-    if (!use_dma_irq) {
-        dma_wmb();
-
-        writel(EDU_DMA_CMD_RUN | direction,
-                edu->bar0 + EDU_REG_DMA_CMD);
-
-        return edu_wait_for_dma(edu);
-    }
 
     WRITE_ONCE(edu->last_irq_status, 0);
     reinit_completion(&edu->irq_done);
@@ -156,6 +169,11 @@ static int edu_run_dma(struct edu_device *edu, u32 direction) {
     return 0;
 }
 
+static const struct edu_dma_ops edu_dma_interrupt_ops = {
+    .name = "interrupt",
+    .run = edu_run_dma_interrupt,
+};
+
 static int edu_dma_self_test(struct edu_device *edu) {
     u8 *buffer = edu->dma_buffer;
     size_t index;
@@ -169,7 +187,7 @@ static int edu_dma_self_test(struct edu_device *edu) {
     writeq(EDU_DEVICE_BUFFER_OFFSET, edu->bar0 + EDU_REG_DMA_DST);
     writeq(EDU_DMA_TEST_SIZE, edu->bar0 + EDU_REG_DMA_COUNT);
 
-    ret = edu_run_dma(edu, 0);
+    ret = edu->dma_ops->run(edu, 0);
     if (ret)
         return ret;
 
@@ -180,7 +198,7 @@ static int edu_dma_self_test(struct edu_device *edu) {
     writeq((u64)edu->dma_handle, edu->bar0 + EDU_REG_DMA_DST);
     writeq(EDU_DMA_TEST_SIZE, edu->bar0 + EDU_REG_DMA_COUNT);
 
-    ret = edu_run_dma(edu, EDU_DMA_CMD_FROM_DEVICE);
+    ret = edu->dma_ops->run(edu, EDU_DMA_CMD_FROM_DEVICE);
     if (ret)
         return ret;
 
@@ -196,7 +214,7 @@ static int edu_dma_self_test(struct edu_device *edu) {
     }
 
     dev_info(&edu->pdev->dev, "DMA %s self-test passed\n",
-            use_dma_irq ? "interrupt" : "polling");
+            edu->dma_ops->name);
 
     return 0;
 }
@@ -215,6 +233,9 @@ static int edu_probe(struct pci_dev *pdev,
         return -ENOMEM;
 
     edu->pdev = pdev;
+
+    edu->dma_ops = use_dma_irq ?
+        &edu_dma_interrupt_ops : &edu_dma_polling_ops;
 
     init_completion(&edu->irq_done);
 
