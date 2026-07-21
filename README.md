@@ -15,7 +15,7 @@ Hands-on Yocto Project experiments for custom layers, recipes, image configurati
 ```text
 notes/          Study notes and build logs
 scripts/        Helper scripts
-meta-dongwook/  Custom Yocto layer
+meta-labs/  Custom Yocto layer
 ```
 
 ## Local Build Layout
