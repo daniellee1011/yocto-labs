@@ -6,6 +6,7 @@
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
 #include <linux/string.h>
+#include <linux/iopoll.h>
 
 #define EDU_VENDOR_ID       0x1234
 #define EDU_DEVICE_ID       0x11e8
@@ -14,6 +15,20 @@
 #define EDU_DMA_MASK_BITS   28
 #define EDU_DMA_BUFFER_SIZE 4096
 
+#define EDU_REG_DMA_SRC     0x80
+#define EDU_REG_DMA_DST     0x88
+#define EDU_REG_DMA_COUNT   0x90
+#define EDU_REG_DMA_CMD     0x98
+
+#define EDU_DEVICE_BUFFER_OFFSET    0x40000
+#define EDU_DMA_TEST_SIZE           256
+
+#define EDU_DMA_CMD_RUN             BIT(0)  // Start transfer
+#define EDU_DMA_CMD_FROM_DEVICE     BIT(1)  // EDU to RAM
+
+#define EDU_DMA_POLL_DELAY_US       1000
+#define EDU_DMA_TIMEOUT_US          1000000
+
 struct edu_device {
     struct pci_dev *pdev;
     void __iomem *bar0;
@@ -21,6 +36,69 @@ struct edu_device {
     void *dma_buffer;   // CPU virtual address; CPU accesses it
     dma_addr_t dma_handle;  // device/DMA address; hardware receives it
 };
+
+static int edu_wait_for_dma(struct edu_device *edu) {
+    u32 command;
+    int ret;
+
+    ret = readl_poll_timeout(edu->bar0 + EDU_REG_DMA_CMD, command,
+            !(command & EDU_DMA_CMD_RUN), EDU_DMA_POLL_DELAY_US, EDU_DMA_TIMEOUT_US);
+    if (ret)
+        dev_err(&edu->pdev->dev, "DMA polling timed out\n");
+
+    return ret;
+}
+
+static int edu_dma_self_test(struct edu_device *edu) {
+    u8 *buffer = edu->dma_buffer;
+    size_t index;
+    int ret;
+
+    for (index = 0; index < EDU_DMA_TEST_SIZE; ++index)
+        buffer[index] = (u8)index;
+
+    /* System RAM to EDU internal memory. */
+    writeq((u64)edu->dma_handle, edu->bar0 + EDU_REG_DMA_SRC);
+    writeq(EDU_DEVICE_BUFFER_OFFSET, edu->bar0 + EDU_REG_DMA_DST);
+    writeq(EDU_DMA_TEST_SIZE, edu->bar0 + EDU_REG_DMA_COUNT);
+
+    dma_wmb();
+    writel(EDU_DMA_CMD_RUN, edu->bar0 + EDU_REG_DMA_CMD);
+
+    ret = edu_wait_for_dma(edu);
+    if (ret)
+        return ret;
+
+    memset(buffer, 0, EDU_DMA_TEST_SIZE);
+
+    /* EDU internal memory back to system RAM. */
+    writeq(EDU_DEVICE_BUFFER_OFFSET, edu->bar0 + EDU_REG_DMA_SRC);
+    writeq((u64)edu->dma_handle, edu->bar0 + EDU_REG_DMA_DST);
+    writeq(EDU_DMA_TEST_SIZE, edu->bar0 + EDU_REG_DMA_COUNT);
+
+    dma_wmb();
+    writel(EDU_DMA_CMD_RUN | EDU_DMA_CMD_FROM_DEVICE,
+            edu->bar0 + EDU_REG_DMA_CMD);
+
+    ret = edu_wait_for_dma(edu);
+    if (ret)
+        return ret;
+
+    dma_rmb();
+
+    for (index = 0; index < EDU_DMA_TEST_SIZE; ++index) {
+        if (buffer[index] != (u8)index) {
+            dev_err(&edu->pdev->dev,
+                    "DMA mismatch at byte %zu: expected %#x, received %#x\n",
+                    index, (u8)index, buffer[index]);
+            return -EIO;
+        }
+    }
+
+    dev_info(&edu->pdev->dev, "DMA polling self-test passed\n");
+
+    return 0;
+}
 
 static int edu_probe(struct pci_dev *pdev,
         const struct pci_device_id *id) {
@@ -85,6 +163,10 @@ static int edu_probe(struct pci_dev *pdev,
 
     pci_set_master(pdev);
 
+    ret = edu_dma_self_test(edu);
+    if (ret)
+        goto err_free_dma;
+
     pci_set_drvdata(pdev, edu);
 
     dev_info(&pdev->dev, "BAR0 %pR\n", &pdev->resource[0]);
@@ -94,6 +176,12 @@ static int edu_probe(struct pci_dev *pdev,
     dev_info(&pdev->dev, "DMA bus address=%pad\n", &edu->dma_handle);
 
     return 0;
+
+err_free_dma:
+    pci_clear_master(pdev);
+
+    dma_free_coherent(&pdev->dev, EDU_DMA_BUFFER_SIZE,
+            edu->dma_buffer, edu->dma_handle);
 
 err_iounmap:
     pci_iounmap(pdev, edu->bar0);
